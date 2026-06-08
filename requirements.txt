@@ -6,7 +6,7 @@ requests>=2.31.0
 crawl4ai>=0.3.0
 
 # Task 3 - Document conversion
-markitdown>=0.1.0
+markitdown[all]>=0.1.0
 
 # Task 4 - Chunking & Indexing
 langchain-text-splitters>=0.2.0
@@ -34,6 +34,6 @@ streamlit>=1.35.0
 # chainlit>=1.0.0        # Alternative for chatbot
 
 # Group project - Evaluation (choose one)
-deepeval>=1.0.0
+# deepeval>=1.0.0
 # ragas>=0.1.0           # Alternative
 # trulens>=1.0.0         # Alternative
