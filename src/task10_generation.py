@@ -10,11 +10,16 @@ Hướng dẫn:
 """
 
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from .task9_retrieval_pipeline import retrieve
+except ImportError:
+    from task9_retrieval_pipeline import retrieve
 
-from .task9_retrieval_pipeline import retrieve
+load_dotenv()
 
 
 # =============================================================================
@@ -33,12 +38,11 @@ TOP_P = 0.9
 # Chọn 0.3 vì: RAG cần factual, ít sáng tạo
 TEMPERATURE = 0.3
 
-
 # =============================================================================
 # SYSTEM PROMPT
 # =============================================================================
 
-SYSTEM_PROMPT = """Answer the following question comprehensively in Vietnamese.
+SYSTEM_PROMPT =  """Answer the following question comprehensively in Vietnamese.
 For every statement of fact or claim, immediately insert a citation in brackets
 linking to the specific source (e.g., [Luật Phòng chống ma tuý 2021, Điều 3]
 or [VnExpress, 2024]).
@@ -58,6 +62,15 @@ Rules:
 # DOCUMENT REORDERING (tránh lost in the middle)
 # =============================================================================
 
+
+def _citation(chunk: dict) -> str:
+    metadata = chunk.get("metadata", {})
+    source = metadata.get("source") or metadata.get("filename") or "Unknown source"
+    stem = Path(str(source)).stem
+    doc_type = metadata.get("type", "source")
+    return f"[{stem}, {doc_type}]"
+
+
 def reorder_for_llm(chunks: list[dict]) -> list[dict]:
     """
     Sắp xếp chunks để tránh "lost in the middle" effect.
@@ -75,21 +88,17 @@ def reorder_for_llm(chunks: list[dict]) -> list[dict]:
     Returns:
         List reordered để maximize LLM attention.
     """
-    # TODO: Implement reordering
-    #
-    # if len(chunks) <= 2:
-    #     return chunks
-    #
-    # # Split into first half (important → đầu) and second half (important → cuối)
-    # reordered = []
-    # for i in range(0, len(chunks), 2):
-    #     reordered.append(chunks[i])  # Odd positions go first
-    # for i in range(len(chunks) - 1 - (len(chunks) % 2 == 0), 0, -2):
-    #     reordered.append(chunks[i])  # Even positions go last (reversed)
-    #
-    # return reordered
-    raise NotImplementedError("Implement reorder_for_llm")
+    if len(chunks) <= 2:
+        return chunks
 
+    front = []
+    back = []
+    for index, chunk in enumerate(chunks):
+        if index % 2 == 0:
+            front.append(chunk)
+        else:
+            back.append(chunk)
+    return front + list(reversed(back))
 
 # =============================================================================
 # CONTEXT FORMATTING
@@ -106,19 +115,87 @@ def format_context(chunks: list[dict]) -> str:
     Returns:
         Formatted context string.
     """
-    # TODO: Implement context formatting
-    #
-    # context_parts = []
-    # for i, chunk in enumerate(chunks, 1):
-    #     source = chunk.get("metadata", {}).get("source", f"Source {i}")
-    #     doc_type = chunk.get("metadata", {}).get("type", "unknown")
-    #     context_parts.append(
-    #         f"[Document {i} | Source: {source} | Type: {doc_type}]\n"
-    #         f"{chunk['content']}\n"
-    #     )
-    # return "\n---\n".join(context_parts)
-    raise NotImplementedError("Implement format_context")
+    parts = []
+    for index, chunk in enumerate(chunks, start=1):
+        metadata = chunk.get("metadata", {})
+        source = metadata.get("source", f"source_{index}")
+        doc_type = metadata.get("type", "unknown")
+        score = float(chunk.get("score", 0.0))
+        parts.append(
+            f"[Document {index} | Source: {source} | Type: {doc_type} | Score: {score:.3f}]\n"
+            f"{chunk.get('content', '')}"
+        )
+    return "\n\n---\n\n".join(parts)
 
+
+def _build_prompt(query: str, context: str) -> str:
+    return f"Context:\n{context}\n\nQuestion: {query}"
+
+
+def _generate_openai(query: str, context: str) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _build_prompt(query, context)},
+            ],
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+        )
+        return response.choices[0].message.content or None
+    except Exception as exc:
+        print(f"[INFO] OpenAI generation failed: {exc}")
+        return None
+
+
+def _generate_gemini(query: str, context: str) -> str | None:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+            system_instruction=SYSTEM_PROMPT,
+        )
+        response = model.generate_content(
+            _build_prompt(query, context),
+            generation_config=genai.types.GenerationConfig(
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+            ),
+        )
+        return response.text or None
+    except Exception as exc:
+        print(f"[INFO] Gemini generation failed: {exc}")
+        return None
+
+
+def _evidence_answer(query: str, chunks: list[dict]) -> str:
+    if not chunks:
+        return "I cannot verify this information."
+
+    best = chunks[0]
+    content = " ".join(best.get("content", "").split())
+    excerpt = content[:450].rstrip()
+    if len(content) > 450:
+        excerpt += "..."
+
+    return (
+        f"Thong tin lien quan den cau hoi '{query}' duoc tim thay trong nguon "
+        f"{_citation(best)}: {excerpt} {_citation(best)}"
+    )
 
 # =============================================================================
 # GENERATION
@@ -146,43 +223,19 @@ def generate_with_citation(query: str, top_k: int = TOP_K) -> dict:
             'retrieval_source': str  # 'hybrid' hoặc 'pageindex'
         }
     """
-    # TODO: Implement generation pipeline
-    #
-    # # Step 1: Retrieve
-    # chunks = retrieve(query, top_k=top_k)
-    #
-    # # Step 2: Reorder
-    # reordered = reorder_for_llm(chunks)
-    #
-    # # Step 3: Format context
-    # context = format_context(reordered)
-    #
-    # # Step 4: Build prompt
-    # user_message = f"""Context:\n{context}\n\n---\n\nQuestion: {query}"""
-    #
-    # # Step 5: Call LLM
-    # from openai import OpenAI
-    # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    #
-    # response = client.chat.completions.create(
-    #     model="gpt-4o-mini",
-    #     messages=[
-    #         {"role": "system", "content": SYSTEM_PROMPT},
-    #         {"role": "user", "content": user_message}
-    #     ],
-    #     temperature=TEMPERATURE,
-    #     top_p=TOP_P,
-    # )
-    #
-    # answer = response.choices[0].message.content
-    #
-    # # Step 6: Return
-    # return {
-    #     "answer": answer,
-    #     "sources": chunks,
-    #     "retrieval_source": chunks[0].get("source", "hybrid") if chunks else "none"
-    # }
-    raise NotImplementedError("Implement generate_with_citation")
+    chunks = retrieve(query, top_k=top_k)
+    reordered = reorder_for_llm(chunks)
+    context = format_context(reordered)
+
+    answer = _generate_openai(query, context) or _generate_gemini(query, context)
+    if not answer:
+        answer = _evidence_answer(query, reordered)
+
+    return {
+        "answer": answer,
+        "sources": chunks,
+        "retrieval_source": chunks[0].get("source", "none") if chunks else "none",
+    }
 
 
 if __name__ == "__main__":
